@@ -1,26 +1,99 @@
-// A working entry for a make.fun video-on-X bounty (Node 22, standard library only): it copies POST.json from the
-// repository root to /output/POST.json, where the gate reads it. That is all the program has to do. The entry is the
-// post itself: your agent makes a short video on the subject this bounty's rules name, ending with make.fun's referral
-// end card (https://make.fun/press/manifest.json) and your referral code, the video is posted natively on X
-// from a public account with make.fun or @makefunai and your play code in the post's text, POST.json names the post,
-// and the house reads the post's views and interactions from X. Nothing this program writes about the post is scored.
+// make.fun entry: validate POST.json, then hand it to the gate.
 //
-// The POST.json this starter ships holds a placeholder address, so the gate refuses it as it stands (valid 0).
-// Replace it with your post's address before you submit.
+// Reads POST.json from MAKEFUN_BOT_DIR (default /bot), checks that it names an X/Twitter status post,
+// and copies it unchanged to MAKEFUN_OUTPUT_DIR (default /output)/POST.json. Any problem → stderr + exit 1.
 //
-// Outside the grader's container, MAKEFUN_BOT_DIR and MAKEFUN_OUTPUT_DIR stand in for /bot and /output:
-//   mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out node main.ts
+// Local run:
+//   mkdir -p /tmp/mf-out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=/tmp/mf-out node main.ts
 
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? '/bot';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const botDir: string = process.env.MAKEFUN_BOT_DIR ?? '/bot';
+const outputDir: string = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const sourcePath: string = join(botDir, 'POST.json');
+const targetPath: string = join(outputDir, 'POST.json');
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-try {
-  copyFileSync(join(BOT_DIR, 'POST.json'), join(OUTPUT_DIR, 'POST.json'));
-} catch (err) {
-  console.error(`POST.json could not be copied from ${BOT_DIR}: ${(err as Error).message}`);
+const ALLOWED_HOSTS: ReadonlySet<string> = new Set(['x.com', 'twitter.com']);
+const STATUS_PATH = /\/status\/(\d+)(?:\/|$)/;
+
+function fail(message: string): never {
+  console.error(`main.ts: ${message}`);
   process.exit(1);
 }
+
+function describe(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Returns the post id if `raw` is an X/Twitter status URL, otherwise exits with a reason. */
+function extractPostId(raw: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    fail(`"url" is not a valid URL: ${JSON.stringify(raw)}`);
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    fail(`"url" must use http(s), got ${parsed.protocol} in ${raw}`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!ALLOWED_HOSTS.has(host)) {
+    fail(`"url" host must be x.com or twitter.com, got ${host}`);
+  }
+  const match = STATUS_PATH.exec(parsed.pathname);
+  if (match === null) {
+    fail(`"url" path must contain /status/<digits>, got ${parsed.pathname}`);
+  }
+  return match[1];
+}
+
+// 1. Read and validate the source before touching the output dir.
+// Keep the raw bytes: they are what gets validated, and later what the output must match.
+let sourceBytes: Buffer;
+try {
+  sourceBytes = readFileSync(sourcePath);
+} catch (err) {
+  fail(`cannot read ${sourcePath}: ${describe(err)}`);
+}
+const sourceText: string = sourceBytes.toString('utf8');
+
+let post: unknown;
+try {
+  post = JSON.parse(sourceText);
+} catch (err) {
+  fail(`${sourcePath} is not valid JSON: ${describe(err)}`);
+}
+
+if (typeof post !== 'object' || post === null || Array.isArray(post)) {
+  fail(`${sourcePath} must hold a JSON object`);
+}
+const url: unknown = (post as Record<string, unknown>).url;
+if (typeof url !== 'string') {
+  fail(`${sourcePath} must have a string field "url"`);
+}
+const postId = extractPostId(url);
+
+// 2. Copy it, byte for byte, to where the gate reads it.
+try {
+  mkdirSync(outputDir, { recursive: true });
+  copyFileSync(sourcePath, targetPath);
+} catch (err) {
+  fail(`cannot copy ${sourcePath} to ${targetPath}: ${describe(err)}`);
+}
+
+// 3. Verify: the file the gate will read must be exactly the bytes we validated above.
+let copiedBytes: Buffer;
+try {
+  copiedBytes = readFileSync(targetPath);
+} catch (err) {
+  fail(`cannot re-read ${targetPath} after copying: ${describe(err)}`);
+}
+if (!copiedBytes.equals(sourceBytes)) {
+  fail(
+    `${targetPath} does not match the validated source ` +
+      `(${copiedBytes.length} bytes written vs ${sourceBytes.length} validated)`,
+  );
+}
+
+console.log(`POST.json copied to ${targetPath} (post id ${postId})`);
